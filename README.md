@@ -1,1 +1,1 @@
-# SiriusCourceAmetov
+# SiriusCourseAmetov
