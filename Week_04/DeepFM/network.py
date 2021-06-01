@@ -26,7 +26,7 @@ class DenseFeatureLayer(nn.Module):
             self.first_order_embd[col] = torch.nn.Embedding(nrof_cat[col], 1)
         self.first_order_scalar = nn.ParameterDict({})
         for i, col in enumerate(numeric_columns):
-            self.first_order_scalar[col] = nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(1,1)))
+            self.first_order_scalar[col] = nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(1, 1)))
 
         self.second_order_embd = nn.ModuleDict({})
         for i, col in enumerate(self.emb_columns):
@@ -44,11 +44,13 @@ class DenseFeatureLayer(nn.Module):
         first_order_embd_output = None
         for i, col in enumerate(self.emb_columns):
             if first_order_embd_output is None:
-                first_order_embd_output = self.first_order_embd[col](torch.tensor(input_data[self.emb_columns[i]], dtype=torch.int64))
+                # first_order_embd_output = self.first_order_embd[col](
+                #     torch.tensor(input_data[self.emb_columns[i]], dtype=torch.int64))
+                new = self.first_order_embd[col](input_data[self.emb_columns[i]].long())
+                first_order_embd_output = new
             else:
-                first_order_embd_output = torch.cat(
-                    [first_order_embd_output, self.first_order_embd[col](torch.tensor(input_data[self.emb_columns[i]], dtype=torch.int64))],
-                    dim=1)
+                new = self.first_order_embd[col](input_data[self.emb_columns[i]].long())
+                first_order_embd_output = torch.cat([first_order_embd_output, new], dim=1)
 
         first_order_embd_output = torch.squeeze(first_order_embd_output, dim=2)
         for i, col in enumerate(self.numeric_columns):
@@ -63,13 +65,13 @@ class DenseFeatureLayer(nn.Module):
         second_order_embd_output = None
         for i, col in enumerate(self.emb_columns):
             if second_order_embd_output is None:
-                second_order_embd_output = self.second_order_embd[col](
-                    torch.tensor(input_data[self.emb_columns[i]], dtype=torch.int64))
+                # second_order_embd_output = self.second_order_embd[col](
+                #     torch.tensor(input_data[self.emb_columns[i]], dtype=torch.int64))
+                new = self.second_order_embd[col](input_data[self.emb_columns[i]].long())
+                second_order_embd_output = new
             else:
-                second_order_embd_output = torch.cat(
-                    [second_order_embd_output,
-                     self.second_order_embd[col](torch.tensor(input_data[self.emb_columns[i]], dtype=torch.int64))],
-                    dim=1)
+                new = self.second_order_embd[col](input_data[self.emb_columns[i]].long())
+                second_order_embd_output = torch.cat([second_order_embd_output, new], dim=1)
 
         for i, col in enumerate(self.numeric_columns):
             if second_order_embd_output is None:
@@ -88,6 +90,7 @@ class DenseFeatureLayer(nn.Module):
 
         return first_order_embd_output, second_order_embd_output
 
+
 class FMLayer(nn.Module):
 
     def __init__(self, ):
@@ -98,10 +101,12 @@ class FMLayer(nn.Module):
     def forward(self, first_order_embd, second_order_embd):
         # sum_square part
         summed_features_embd = torch.sum(second_order_embd, dim=1)
-        summed_features_embd_square = torch.square(summed_features_embd)
+        # summed_features_embd_square = torch.square(summed_features_embd)
+        summed_features_embd_square = summed_features_embd ** 2
 
         # square_sum part
-        squared_features_embd = torch.square(second_order_embd)
+        # squared_features_embd = torch.square(second_order_embd)
+        squared_features_embd = second_order_embd ** 2
         squared_sum_features_embd = torch.sum(squared_features_embd, dim=1)
 
         # second order
@@ -109,6 +114,7 @@ class FMLayer(nn.Module):
                                        squared_sum_features_embd)
 
         return first_order_embd, second_order
+
 
 class MLPLayer(nn.Module):
 
@@ -155,6 +161,20 @@ class DeepFMNet(nn.Module):
 
         input_size = len(emb_columns) + len(numeric_columns) + emb_dim + output_size
         self.dense_layer = nn.Linear(input_size, nrof_out_classes)
+
+    def turn_eval(self):
+        for p in self.parameters():
+            p.requires_grad = False
+
+        print('Turned all the submodules to eval')
+        return
+
+    def turn_train(self):
+        for p in self.parameters():
+            p.requires_grad = True
+
+        print('Turned all the submodules to eval')
+        return
 
     def forward(self, input_data):
         first_order_embd, second_order_embd = self.features_embd(input_data)
