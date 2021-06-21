@@ -203,7 +203,8 @@ class TabNet(nn.Module):
         # Init
         x_d_out = 0
         x_d_out = torch.relu(x_d_out_step)
-        masks = []
+        batch, n_features = x_features.shape
+        masks = torch.zeros(self.n_steps, batch, n_features)
         mask = torch.ones_like(x)
 
         # print('Features before the training loop')
@@ -220,7 +221,8 @@ class TabNet(nn.Module):
                 prior_scales = prior_scales * (self.gamma - mask)
             # Use attentive transformer to calculate the mask
             mask = self.attentive_tfs[i](x_a_out_step, prior_scales=prior_scales)
-            masks.append(mask)
+            masks[i] = mask
+
             x = x_features * mask
             x = self.single_shared_layer(x)
             x = self.multi_dependent_layers[i](x)
@@ -233,4 +235,4 @@ class TabNet(nn.Module):
         output = self.layer_out(x_d_out)
         output = output.view(-1)
 
-        return output
+        return output, masks

@@ -1,5 +1,4 @@
 import os
-import numpy as np
 import torch
 
 print('PyTorch Version', torch.__version__)
@@ -13,11 +12,14 @@ from datetime import datetime
 from network_tabnet import TabNet
 from data_loader import CustomDataset
 
-EPOCHS = 10
+# Operating with the steps instead of epochs
+EPOCHS = 1000
 EMBEDDING_DIM = 16
-BATCH_SIZE = 4096
-OPTIMIZER = 'Adam'
-LEARNING_RATE = 0.01
+BATCH_SIZE = 1024
+OPTIMIZER = 'Adagrad'
+LEARNING_RATE = 0.02
+WEIGHT_DECAY = 0.0001
+LEARNING_RATE_DECAY = 0.4
 TRAIN_PATH = '../data/train_adult_cut.pickle'
 VALID_PATH = '../data/valid_adult_cut.pickle'
 N_STEPS = 5
@@ -25,6 +27,7 @@ N_D = 16
 N_A = 16
 LAMBDA_SPARSE = 0.001
 GAMMA = 1.5
+LEARNING_RATE_WARMUP_STEPS = 10
 
 
 class TabNetTrainer(torch.nn.Module):
@@ -48,6 +51,7 @@ class TabNetTrainer(torch.nn.Module):
             print('Logging to the', model_path)
         self.tXw = SummaryWriter(model_path)
         self.log_params()
+        self.global_step = 0
 
         self.network = TabNet(nrof_unique_categories=self.train_dataset.nrof_unique_categories,
                               embedding_dim=EMBEDDING_DIM,
@@ -59,17 +63,20 @@ class TabNetTrainer(torch.nn.Module):
         # Exponential decay is used
 
         self.loss = torch.nn.BCEWithLogitsLoss()
-        self.optimizer = optim.Adam(self.network.parameters(), lr=LEARNING_RATE)
-        self.learning_rate_decay = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer, gamma=0.8)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        self.lr_exp_decay = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer, gamma=0.8)
 
         return
 
     def log_params(self):
-        self.tXw.add_hparams(hparam_dict={
+        text_dict = {
             'EPOCHS': EPOCHS,
             'EMBEDDING_DIM': EMBEDDING_DIM,
             'BATCH_SIZE': BATCH_SIZE,
+            'OPTIMIZER': OPTIMIZER,
             'LEARNING_RATE': LEARNING_RATE,
+            'WEIGHT_DECAY': WEIGHT_DECAY,
+            'LEARNING_RATE_DECAY': LEARNING_RATE_DECAY,
             'TRAIN_PATH': TRAIN_PATH,
             'VALID_PATH': VALID_PATH,
             'N_STEPS': N_STEPS,
@@ -77,27 +84,32 @@ class TabNetTrainer(torch.nn.Module):
             'N_A': N_A,
             'LAMBDA_SPARSE': LAMBDA_SPARSE,
             'GAMMA': GAMMA,
-        }, metric_dict={})
-        return
-
-    def load_model(self, restore_path=''):
-        if restore_path == '':
-            self.step = 0
-        else:
-            pass
-
+            'LEARNING_RATE_WARMUP_STEPS': LEARNING_RATE_WARMUP_STEPS,
+        }
+        l = [key + str(value) for key, value in text_dict.items()]
+        text = '\n'.join(l)
+        self.tXw.add_text(tag='Settings', text_string=text)
         return
 
     def run_train(self):
         print('Run train ...')
         BATCHES = len(self.train_loader)
 
-        self.load_model()
-
         for epoch in range(EPOCHS):
             self.network.train()
 
+            tenth = len(self.train_loader) // 10
             for i, (x_num, x_cat, label) in enumerate(self.train_loader):
+                if self.global_step < LEARNING_RATE_WARMUP_STEPS:
+                    lr_step = LEARNING_RATE * self.global_step / LEARNING_RATE_WARMUP_STEPS + 1e-5
+                    for g in self.optimizer.param_groups:
+                        g['lr'] = lr_step
+                    print('Setting LR to value', lr_step)
+                elif self.global_step == LEARNING_RATE_WARMUP_STEPS:
+                    for g in self.optimizer.param_groups:
+                        g['lr'] = LEARNING_RATE
+                    print('Set the LR to value', LEARNING_RATE)
+
                 # Reset gradients
                 self.optimizer.zero_grad()
                 # Reshape to the shapes (BatchSize=128, -1)
@@ -107,35 +119,44 @@ class TabNetTrainer(torch.nn.Module):
                 # Reshape to the shape (BatchSize, ) because it contains a single label
                 label = label.to('cuda:0').view(BATCH_SIZE)
 
-                output = self.network(x_num, x_cat)
+                output, masks = self.network(x_num, x_cat)
 
                 # Calculate error and backpropagate
-                loss = self.loss(output, label)
+                eps = 0.00001
+                binary_loss = self.loss(output, label)
+                l_sparse_loss = (-1) * torch.sum(masks * torch.log(masks + eps)) / (N_STEPS * BATCH_SIZE)
+                total_loss = binary_loss + l_sparse_loss
 
                 output = torch.round(torch.sigmoid(output))
 
-                loss.backward()
+                total_loss.backward()
                 acc = (output == label).float().mean().item()
 
                 # Update weights with gradients
                 self.optimizer.step()
+                self.global_step += 1
+                if self.global_step % 2500 == 0:
+                    self.lr_exp_decay.step()
 
-                self.tXw.add_scalar('Loss', loss, self.step)
-                self.tXw.add_scalar('Accuracy/Train', acc, self.step)
+                self.tXw.add_scalar('Loss/BinaryLoss', binary_loss.item(), self.global_step)
+                self.tXw.add_scalar('Loss/LSparseLoss', l_sparse_loss.item(), self.global_step)
+                self.tXw.add_scalar('Loss/TotalLoss', total_loss.item(), self.global_step)
+                self.tXw.add_scalar('Accuracy/Train', acc, self.global_step)
 
-                self.step += 1
+                self.global_step += 1
 
-                print(f'E [{epoch:3}]/[{EPOCHS:3}] Batch [{i:3}]/[{BATCHES:3}] '
-                      f'Loss {loss.item():6.5f} Accuracy {acc:4.3f}')
+                if i % tenth == 0:
+                    print(f'E [{epoch:3}]/[{EPOCHS:3}] Batch [{i:3}]/[{BATCHES:3}] '
+                          f'TotalLoss {total_loss.item():6.5f} Accuracy {acc:4.3f}')
 
-            # self.train_writer.add_histogram('hidden_layer', self.network.linear1.weight.data, self.step)
             print(f'E [{epoch:3}]/[{EPOCHS:3}] Finished!')
 
             # Run validation
             self.network.eval()
             print('Passing to validation')
 
-            acc_all = 0
+            acc_all = torch.zeros(len(self.val_dataset))
+            index = 0
             for i, (x_num, x_cat, label) in enumerate(self.val_loader):
                 # Reset gradients
                 self.optimizer.zero_grad()
@@ -148,15 +169,20 @@ class TabNetTrainer(torch.nn.Module):
 
                 # Reset gradients
                 with torch.no_grad():
-                    output = self.network(x_num, x_cat)
+                    output, _ = self.network(x_num, x_cat)
                     output = torch.round(torch.sigmoid(output))
-                    acc = (output == label).float().mean().item()
-                    acc_all += acc * BATCH_SIZE
-                    print(f'Valid. batch {i:3} Accuracy {acc:4.3f}')
+                    acc = (output == label).float()
+                    acc_all[index:index + BATCH_SIZE] = acc
+                    # print(f'Valid. batch {i:3} Accuracy {acc.mean().item():4.3f}')
 
-            acc_val = acc_all / len(self.val_dataset)
-            self.tXw.add_scalar('Accuracy/Val', acc_val, self.step)
+                index = index + BATCH_SIZE
+
+            acc_val = acc_all.mean().item()
+            self.tXw.add_scalar('Accuracy/Val', acc_val, self.global_step)
             print(f'Valid accuracy {acc_val:4.3f}')
+
+            if self.global_step > 7700:
+                print('Finished training by the 7.7K iterations similar to the TabNet paper')
 
         return
 
