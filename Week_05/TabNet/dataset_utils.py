@@ -16,7 +16,7 @@ with open('../data/valid_adult.pickle', 'rb') as f:
     val_data, _, _ = pickle.load(f)
 
 # region Important novelty
-# There are education and education-num column in the table.
+# There are education and education-num columns in the table.
 # They totally correspond to each other but the education-num column has nan values.
 # It would be convenient to remove one.
 # Nevertheless, it would be used with embeddings.
@@ -100,7 +100,7 @@ for cat in embedding_columns:
     nrof_unique_categories[cat] = len(unique)
     print(f'Category [{cat:20}] Unique values, total [{len(unique):5}]')
     pprint(np.array(list(zip(np.arange(len(unique)), unique))))
-    # Create a dict once adn use it many-many times when changing the str_data
+    # Create a dict once and use it many-many times when changing the str_data
     d_unique = {value: i for i, value in enumerate(unique)}
     # Modify train and val data
     train_data[cat + '_cat'] = [d_unique[value] for value in str_data_train]
