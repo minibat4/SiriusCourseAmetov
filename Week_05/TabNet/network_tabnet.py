@@ -150,11 +150,11 @@ class AttentiveTransformer(nn.Module):
 
 
 class TabNet(nn.Module):
-    features_size = 133
 
-    def __init__(self, nrof_unique_categories, embedding_dim, n_d, n_a, n_steps, gamma):
+    def __init__(self, nrof_unique_categories, embedding_dim, n_d, n_a, n_steps, gamma, features_size=133):
         super(TabNet, self).__init__()
         # Define vars
+        self.features_size = features_size
         self.nrof_unique_categories = nrof_unique_categories
         self.embedding_dim = embedding_dim
         self.n_d = n_d
@@ -193,15 +193,13 @@ class TabNet(nn.Module):
 
     def forward(self, x_num, x_cat):
         # Forward through a DenseFeatureTransformer layer
-        x_features = self.dense_feature_layer.forward(x_num=x_num,
-                                                      x_cat=x_cat)
+        x_features = self.dense_feature_layer.forward(x_num=x_num, x_cat=x_cat)
         x = self.single_shared_layer(x_features)
         x = self.first_dependent_layer(x)
         # Split the first time
         x_d_out_step = x[:, :self.n_d]
         x_a_out_step = x[:, self.n_d:]
         # Init
-        x_d_out = 0
         x_d_out = torch.relu(x_d_out_step)
         batch, n_features = x_features.shape
         masks = torch.zeros(self.n_steps, batch, n_features)

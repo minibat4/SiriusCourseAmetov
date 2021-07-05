@@ -4,21 +4,22 @@ import torch
 print('PyTorch Version', torch.__version__)
 
 import torch.optim as optim
+from torch.optim.lr_scheduler import ExponentialLR, CosineAnnealingLR
 import torch.utils.data as data_utils
+from torch.utils.tensorboard import SummaryWriter
 
-from tensorboardX import SummaryWriter
 from datetime import datetime
 
 from network_tabnet import TabNet
 from data_loader import CustomDataset
 
 # Operating with the steps instead of epochs
-EPOCHS = 1000
-EMBEDDING_DIM = 16
-BATCH_SIZE = 1024
-OPTIMIZER = 'Adagrad'
-LEARNING_RATE = 0.02
-WEIGHT_DECAY = 0.0001
+EPOCHS = 500
+EMBEDDING_DIM = 128
+BATCH_SIZE = 4096
+OPTIMIZER = 'Adam'
+LEARNING_RATE = 0.01
+WEIGHT_DECAY = 0.0005
 LEARNING_RATE_DECAY = 0.4
 TRAIN_PATH = '../data/train_adult_cut.pickle'
 VALID_PATH = '../data/valid_adult_cut.pickle'
@@ -27,15 +28,16 @@ N_D = 16
 N_A = 16
 LAMBDA_SPARSE = 0.001
 GAMMA = 1.5
-LEARNING_RATE_WARMUP_STEPS = 10
+LEARNING_RATE_WARMUP_STEPS = 50
 
 
 class TabNetTrainer(torch.nn.Module):
     def __init__(self):
         super(TabNetTrainer, self).__init__()
 
-        num_workers = 0
+        num_workers = 4
         pin_memory = True
+
         self.train_dataset = CustomDataset(TRAIN_PATH)
         self.train_loader = data_utils.DataLoader(dataset=self.train_dataset,
                                                   batch_size=BATCH_SIZE, shuffle=True,
@@ -52,20 +54,30 @@ class TabNetTrainer(torch.nn.Module):
         self.tXw = SummaryWriter(model_path)
         self.log_params()
         self.global_step = 0
+        self.best_val_acc = 0
 
+        features_size = len(self.train_dataset.embedding_columns) * EMBEDDING_DIM + \
+                        len(self.train_dataset.numeric_columns)
         self.network = TabNet(nrof_unique_categories=self.train_dataset.nrof_unique_categories,
                               embedding_dim=EMBEDDING_DIM,
                               n_d=N_D,
                               n_a=N_A,
                               n_steps=N_STEPS,
-                              gamma=GAMMA)
+                              gamma=GAMMA,
+                              features_size=features_size)
         self.network.to('cuda:0')
         # Exponential decay is used
 
         self.loss = torch.nn.BCEWithLogitsLoss()
-        self.optimizer = optim.Adam(self.network.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        self.lr_exp_decay = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer, gamma=0.8)
+        if OPTIMIZER == 'Adam':
+            self.optimizer = optim.Adam(self.network.parameters(), lr=LEARNING_RATE)
+        elif OPTIMIZER == 'Adagrad':
+            self.optimizer = optim.Adagrad(self.network.parameters(), lr=LEARNING_RATE)
+        elif OPTIMIZER == 'SGD':
+            self.optimizer = optim.SGD(self.network.parameters(), lr=LEARNING_RATE, momentum=0.9, nesterov=True)
 
+        self.lr_exp_decay = ExponentialLR(optimizer=self.optimizer, gamma=0.8)
+        self.lr_cos_decay = CosineAnnealingLR(optimizer=self.optimizer, T_max=len(self.train_loader) * EPOCHS)
         return
 
     def log_params(self):
@@ -86,7 +98,7 @@ class TabNetTrainer(torch.nn.Module):
             'GAMMA': GAMMA,
             'LEARNING_RATE_WARMUP_STEPS': LEARNING_RATE_WARMUP_STEPS,
         }
-        l = [key + str(value) for key, value in text_dict.items()]
+        l = [key + ": " + str(value) for key, value in text_dict.items()]
         text = '\n'.join(l)
         self.tXw.add_text(tag='Settings', text_string=text)
         return
@@ -100,36 +112,46 @@ class TabNetTrainer(torch.nn.Module):
 
             tenth = len(self.train_loader) // 10
             for i, (x_num, x_cat, label) in enumerate(self.train_loader):
-                if self.global_step < LEARNING_RATE_WARMUP_STEPS:
-                    lr_step = LEARNING_RATE * self.global_step / LEARNING_RATE_WARMUP_STEPS + 1e-5
-                    for g in self.optimizer.param_groups:
-                        g['lr'] = lr_step
+                if self.global_step <= LEARNING_RATE_WARMUP_STEPS:
+                    lr_step = LEARNING_RATE * self.global_step / LEARNING_RATE_WARMUP_STEPS
+                    for group in self.optimizer.param_groups:
+                        group['lr'] = lr_step
                     print('Setting LR to value', lr_step)
-                elif self.global_step == LEARNING_RATE_WARMUP_STEPS:
-                    for g in self.optimizer.param_groups:
-                        g['lr'] = LEARNING_RATE
-                    print('Set the LR to value', LEARNING_RATE)
+                else:
+                    for group in self.optimizer.param_groups:
+                        break
+                self.tXw.add_scalar('Accuracy/LearningRate', group['lr'], self.global_step)
 
                 # Reset gradients
                 self.optimizer.zero_grad()
                 # Reshape to the shapes (BatchSize=128, -1)
                 BATCH_SIZE = x_num.shape[0]
-                x_num = x_num.to('cuda:0').view(BATCH_SIZE, -1)
-                x_cat = x_cat.to('cuda:0').view(BATCH_SIZE, -1)
+                x_num = x_num.cuda().view(BATCH_SIZE, -1)
+                x_cat = x_cat.cuda().view(BATCH_SIZE, -1)
                 # Reshape to the shape (BatchSize, ) because it contains a single label
-                label = label.to('cuda:0').view(BATCH_SIZE)
+                label = label.cuda().view(BATCH_SIZE)
 
                 output, masks = self.network(x_num, x_cat)
-
                 # Calculate error and backpropagate
                 eps = 0.00001
                 binary_loss = self.loss(output, label)
                 l_sparse_loss = (-1) * torch.sum(masks * torch.log(masks + eps)) / (N_STEPS * BATCH_SIZE)
-                total_loss = binary_loss + l_sparse_loss
+                wd_loss = None
+                for m in self.modules():
+                    m_w_norm = None
+                    if isinstance(m, torch.nn.BatchNorm1d):
+                        continue
+                    elif isinstance(m, torch.nn.Linear):
+                        m_w_norm = torch.square(m.weight).sum()
+                        if wd_loss is None:
+                            wd_loss = m_w_norm
+                        else:
+                            wd_loss += m_w_norm
+
+                total_loss = binary_loss + LAMBDA_SPARSE * l_sparse_loss + WEIGHT_DECAY * wd_loss
+                total_loss.backward()
 
                 output = torch.round(torch.sigmoid(output))
-
-                total_loss.backward()
                 acc = (output == label).float().mean().item()
 
                 # Update weights with gradients
@@ -137,35 +159,29 @@ class TabNetTrainer(torch.nn.Module):
                 self.global_step += 1
                 if self.global_step % 2500 == 0:
                     self.lr_exp_decay.step()
+                # self.lr_cos_decay.step()
 
                 self.tXw.add_scalar('Loss/BinaryLoss', binary_loss.item(), self.global_step)
                 self.tXw.add_scalar('Loss/LSparseLoss', l_sparse_loss.item(), self.global_step)
+                self.tXw.add_scalar('Loss/WDLoss', wd_loss.item(), self.global_step)
                 self.tXw.add_scalar('Loss/TotalLoss', total_loss.item(), self.global_step)
                 self.tXw.add_scalar('Accuracy/Train', acc, self.global_step)
 
-                self.global_step += 1
-
-                if i % tenth == 0:
+                if tenth != 0 and i % tenth == 0:
                     print(f'E [{epoch:3}]/[{EPOCHS:3}] Batch [{i:3}]/[{BATCHES:3}] '
-                          f'TotalLoss {total_loss.item():6.5f} Accuracy {acc:4.3f}')
-
-            print(f'E [{epoch:3}]/[{EPOCHS:3}] Finished!')
-
+                          f'TotalLoss {total_loss.item():6.5f} Batch Acc {acc:4.3f}')
             # Run validation
             self.network.eval()
-            print('Passing to validation')
 
             acc_all = torch.zeros(len(self.val_dataset))
             index = 0
             for i, (x_num, x_cat, label) in enumerate(self.val_loader):
-                # Reset gradients
-                self.optimizer.zero_grad()
                 # Reshape to the shapes (BatchSize=128, -1)
                 BATCH_SIZE = x_num.shape[0]
-                x_num = x_num.to('cuda:0').view(BATCH_SIZE, -1)
-                x_cat = x_cat.to('cuda:0').view(BATCH_SIZE, -1)
+                x_num = x_num.cuda().view(BATCH_SIZE, -1)
+                x_cat = x_cat.cuda().view(BATCH_SIZE, -1)
                 # Reshape to the shape (BatchSize, ) because it contains a single label
-                label = label.to('cuda:0').view(BATCH_SIZE)
+                label = label.cuda().view(BATCH_SIZE)
 
                 # Reset gradients
                 with torch.no_grad():
@@ -179,14 +195,21 @@ class TabNetTrainer(torch.nn.Module):
 
             acc_val = acc_all.mean().item()
             self.tXw.add_scalar('Accuracy/Val', acc_val, self.global_step)
-            print(f'Valid accuracy {acc_val:4.3f}')
+            self.tXw.flush()
+            sfx = f' </> Best {self.best_val_acc:4.3f}'
+            if self.best_val_acc + 0.005 < acc_val:
+                self.best_val_acc = acc_val
+                sfx = ' -> Higher!'
 
-            if self.global_step > 7700:
-                print('Finished training by the 7.7K iterations similar to the TabNet paper')
+            print(f'E [{epoch:3}]/[{EPOCHS:3}] Val Acc {acc_val:4.3f} {sfx}')
+
+            # if self.global_step > 7700:
+            #     print('Finished training by the 7.7K iterations similar to the TabNet paper')
+            #     break
 
         return
 
 
 if __name__ == '__main__':
-    deep_fm = TabNetTrainer()
-    deep_fm.run_train()
+    tabnet = TabNetTrainer()
+    tabnet.run_train()
